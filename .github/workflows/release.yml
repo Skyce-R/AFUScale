@@ -55,5 +55,6 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" "$IPA" \
               --title "$GITHUB_REF_NAME" \
-              --generate-notes
+              --notes-file docs/release-notes.md \
+              --prerelease
           fi
