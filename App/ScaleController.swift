@@ -3,6 +3,9 @@ import Foundation
 
 @MainActor
 final class ScaleController: NSObject, ObservableObject {
+    let console = ConsoleRecorder()
+    @Published private(set) var captureMode = true
+    private var wantsConnection = true
     @Published var status = "初始化"
     @Published var latest: ScaleMeasurement?
     @Published var latestRawHex = ""
@@ -115,24 +118,93 @@ final class ScaleController: NSObject, ObservableObject {
     private let ffb0 = CBUUID(string: "0000FFB0-0000-1000-8000-00805F9B34FB")
     private let ffb2 = CBUUID(string: "0000FFB2-0000-1000-8000-00805F9B34FB")
 
-    // 身高/年龄在页面配置，持久化到 UserDefaults；性别/校正值仍写死。
-    @Published var heightCm: Double { didSet { UserDefaults.standard.set(heightCm, forKey: "AFUScale.heightCm") } }
-    @Published var age: Int { didSet { UserDefaults.standard.set(age, forKey: "AFUScale.age") } }
-    private let sex: Sex = .male
-    private let calibration = 1.5
+    // 本地个人参数只用于 BMI 与日志快照，不会写入秤。
+    @Published var heightCm: Double { didSet { UserDefaults.standard.set(heightCm, forKey: "AFUScale.heightCm"); console.log("profile.changed", profileFields) } }
+    @Published var age: Int { didSet { UserDefaults.standard.set(age, forKey: "AFUScale.age"); console.log("profile.changed", profileFields) } }
+    @Published var sex: Sex = .male {
+        didSet { UserDefaults.standard.set(sex.rawValue, forKey: "AFUScale.sex"); console.log("profile.changed", profileFields) }
+    }
+    var profileFields: [String: String] {
+        ["heightCm": String(heightCm), "age": String(age), "sex": sex.rawValue,
+         "profileSource": "AFUScale local; scale stored profile unknown"]
+    }
+
+    func startCapture() {
+        captureMode = true
+        wantsConnection = true
+        console.start(profile: profileFields)
+        // Re-discover the full GATT tree when beginning a fresh session.
+        if let peripheral, peripheral.state == .connected {
+            console.log("connection.existing", deviceFields(peripheral))
+            discover(peripheral)
+        } else { startScanningIfReady() }
+    }
+
+    func stopCapture() {
+        wantsConnection = false
+        console.log("scan.stop")
+        central.stopScan()
+        if let peripheral {
+            console.log("connection.cancel", deviceFields(peripheral))
+            central.cancelPeripheralConnection(peripheral)
+        }
+        console.stop()
+        status = "采集已停止，日志保留在本机"
+    }
+
+    func enableNormalSync() {
+        stopCapture()
+        captureMode = false
+        wantsConnection = true
+        requestHealthAuthorization()
+        loadRecords()
+        startScanningIfReady()
+    }
+
+    func lifecycle(_ state: String) { console.log("app.lifecycle", ["state": state]) }
+
+    private func deviceFields(_ device: CBPeripheral) -> [String: String] {
+        ["deviceID": device.identifier.uuidString, "deviceName": device.name ?? ""]
+    }
+    private func characteristicFields(_ device: CBPeripheral, _ ch: CBCharacteristic) -> [String: String] {
+        var fields = deviceFields(device)
+        fields["serviceUUID"] = ch.service?.uuid.uuidString ?? ""
+        fields["characteristicUUID"] = ch.uuid.uuidString
+        fields["serviceIndex"] = ch.service.flatMap { svc in device.services?.firstIndex { $0 === svc } }.map(String.init) ?? ""
+        fields["characteristicIndex"] = ch.service?.characteristics?.firstIndex { $0 === ch }.map(String.init) ?? ""
+        fields["propertiesRaw"] = String(ch.properties.rawValue)
+        fields["isNotifying"] = String(ch.isNotifying)
+        return fields
+    }
+    private func discover(_ device: CBPeripheral) {
+        console.log("gatt.discoverServices.request", deviceFields(device).merging(["filter": captureMode ? "all" : "FFB0"], uniquingKeysWith: { _, new in new }))
+        device.discoverServices(captureMode ? nil : [ffb0])
+    }
+    private func advFields(_ advertisement: [String: Any]) -> [String: String] {
+        advertisement.reduce(into: [:]) { result, item in
+            if let data = item.value as? Data { result[item.key] = Self.hex(data) }
+            else if let values = item.value as? [CBUUID: Data] {
+                result[item.key] = values.keys.sorted { $0.uuidString < $1.uuidString }.map { "\($0.uuidString)=\(Self.hex(values[$0]!))" }.joined(separator: "; ")
+            } else if let values = item.value as? [CBUUID] { result[item.key] = values.map(\.uuidString).joined(separator: ",") }
+            else { result[item.key] = String(describing: item.value) }
+        }
+    }
+    nonisolated static func hex(_ data: Data) -> String { data.map { String(format: "%02x", $0) }.joined(separator: " ") }
+
 
     override init() {
         let d = UserDefaults.standard
         heightCm = d.object(forKey: "AFUScale.heightCm") as? Double ?? 170.0
         age = d.object(forKey: "AFUScale.age") as? Int ?? 25
+        sex = Sex(rawValue: d.string(forKey: "AFUScale.sex") ?? "male") ?? .male
         super.init()
+        console.start(profile: profileFields)
         localRecords = d.data(forKey: Self.localRecordsKey)
             .flatMap { try? JSONDecoder().decode([LocalRecord].self, from: $0) } ?? []
         needsHealthAuthorization = !health.isWriteAuthorized
-        loadRecords()
         central = CBCentralManager(
             delegate: self,
-            queue: nil,
+            queue: .main,
             options: [CBCentralManagerOptionRestoreIdentifierKey: "AFUScale.central"]
         )
     }
@@ -196,8 +268,9 @@ final class ScaleController: NSObject, ObservableObject {
     }
 
     private func startScanningIfReady() {
-        guard central.state == .poweredOn else { return }
-        status = "等待秤"
+        guard wantsConnection, central != nil, central.state == .poweredOn, peripheral == nil else { return }
+        status = captureMode ? "采集模式 · 等待秤" : "等待秤"
+        console.log("scan.start", ["filter": "all; connect AFU name or FFB0", "allowDuplicates": "true"])
         // 前台调试用 nil 扫描所有设备，避免 iOS 因广告包服务字段差异漏掉设备。
         // 连接时再按名称/FFB0 过滤。后台唤醒稳定后可改回 [ffb0]。
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
@@ -213,6 +286,7 @@ final class ScaleController: NSObject, ObservableObject {
             return
         }
         print("[AFUScale][save] final result packet")
+        guard !captureMode else { status = "已收到最终包，继续采集"; return }
         save(measurement)
     }
 
@@ -253,16 +327,10 @@ final class ScaleController: NSObject, ObservableObject {
         return LocalRecord(date: date, weightKg: m.weight, bmi: m.bmi, bodyFatPercent: m.fat)
     }
 
-    /// 没量到阻抗就不给体脂率，宁可缺失也不写一个只靠身高体重猜出来的值。
+    /// 原项目的 BMI 体脂估算未使用阻抗；诊断版本暂不把它写入健康。
     private func metrics(_ measurement: ScaleMeasurement) -> (weight: Double, bmi: Double, fat: Double?) {
         let weight = (measurement.weightKg * 100).rounded() / 100
-        return (
-            weight,
-            BodyMetrics.bmi(weightKg: weight, heightCm: heightCm),
-            measurement.impedance == nil
-                ? nil
-                : BodyMetrics.bodyFatPercent(weightKg: weight, heightCm: heightCm, age: age, sex: sex, calibration: calibration)
-        )
+        return (weight, BodyMetrics.bmi(weightKg: weight, heightCm: heightCm), nil)
     }
 
     private func disconnectFromScale() {
@@ -274,89 +342,175 @@ final class ScaleController: NSObject, ObservableObject {
     }
 }
 
+// CBCentralManager uses the main queue. Execute callbacks synchronously on that
+// actor so journal sequence preserves callback order (no unstructured Task hops).
 extension ScaleController: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        Task { @MainActor in
-            if central.state == .poweredOn {
-                self.startScanningIfReady()
-            } else {
-                self.status = "蓝牙不可用：\(central.state.rawValue)"
-            }
+        MainActor.assumeIsolated {
+            console.log("bluetooth.state", ["stateRaw": String(central.state.rawValue)])
+            if central.state == .poweredOn { startScanningIfReady() }
+            else { status = "蓝牙不可用：\(central.state.rawValue)" }
         }
     }
-
-    nonisolated func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
-        Task { @MainActor in
-            self.status = "系统恢复后台蓝牙状态"
-            self.startScanningIfReady()
+    nonisolated func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        MainActor.assumeIsolated {
+            console.log("bluetooth.restore", ["keys": dict.keys.sorted().joined(separator: ",")])
+            let devices = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+            // End old connections, then discover again so this journal gets the GATT tree.
+            for device in devices { central.cancelPeripheralConnection(device) }
         }
     }
-
-    nonisolated func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        let peripheralName = peripheral.name
-        let nameForDisplay = localName ?? peripheralName ?? ""
-        let serviceUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
-        Task { @MainActor in
-            let hasFFB0 = serviceUUIDs.contains(self.ffb0)
-            let isTargetLocalName = localName == self.targetName
-            let isClone = nameForDisplay.contains("Clone")
-            guard (isTargetLocalName || hasFFB0), !isClone else { return }
-            self.status = "发现 AFU-WL-TZ-A1，连接中"
-            self.peripheral = peripheral
-            peripheral.delegate = self
+    nonisolated func centralManager(_ central: CBCentralManager, didDiscover device: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        MainActor.assumeIsolated {
+            let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? device.name ?? ""
+            let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+            guard (name == targetName || services.contains(ffb0)), !name.contains("Clone") else { return }
+            var fields = advFields(advertisementData)
+            fields.merge(deviceFields(device), uniquingKeysWith: { _, new in new })
+            fields["rssi"] = RSSI.stringValue
+            console.log("advertisement", fields)
+            guard wantsConnection, peripheral == nil else { return }
+            peripheral = device
+            device.delegate = self
+            status = "发现 \(name.isEmpty ? "FFB0 设备" : name)，连接中"
+            console.log("scan.stop")
             central.stopScan()
-            central.connect(peripheral, options: nil)
+            console.log("connection.request", deviceFields(device))
+            central.connect(device, options: nil)
         }
     }
-
-    nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        Task { @MainActor in
-            self.status = "已连接，发现服务"
-            peripheral.discoverServices([self.ffb0])
+    nonisolated func centralManager(_ central: CBCentralManager, didConnect device: CBPeripheral) {
+        MainActor.assumeIsolated {
+            guard wantsConnection, device === peripheral else { central.cancelPeripheralConnection(device); return }
+            console.log("connection.connected", deviceFields(device))
+            status = "已连接，发现服务"
+            discover(device)
         }
     }
-
-    nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        Task { @MainActor in
-            self.peripheral = nil
-            self.status = "已断开，等待秤"
-            self.startScanningIfReady()
+    nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect device: CBPeripheral, error: Error?) {
+        MainActor.assumeIsolated {
+            console.log("connection.failed", deviceFields(device).merging(["error": error?.localizedDescription ?? ""], uniquingKeysWith: { _, new in new }))
+            if device === peripheral { peripheral = nil }
+            startScanningIfReady()
+        }
+    }
+    nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral device: CBPeripheral, error: Error?) {
+        MainActor.assumeIsolated {
+            console.log("connection.disconnected", deviceFields(device).merging(["error": error?.localizedDescription ?? ""], uniquingKeysWith: { _, new in new }))
+            if device === peripheral { peripheral = nil }
+            startScanningIfReady()
         }
     }
 }
 
 extension ScaleController: CBPeripheralDelegate {
-    nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        Task { @MainActor in
-            guard let services = peripheral.services else { return }
-            for service in services where service.uuid == self.ffb0 {
-                peripheral.discoverCharacteristics([self.ffb2], for: service)
+    nonisolated func peripheral(_ device: CBPeripheral, didDiscoverServices error: Error?) {
+        MainActor.assumeIsolated {
+            guard wantsConnection, device === peripheral else { return }
+            console.log("gatt.services.result", ["deviceID": device.identifier.uuidString, "error": error?.localizedDescription ?? "", "count": String(device.services?.count ?? 0)])
+            guard error == nil else { return }
+            for (index, service) in (device.services ?? []).enumerated() where captureMode || service.uuid == ffb0 {
+                console.log("gatt.service", ["serviceUUID": service.uuid.uuidString, "serviceIndex": String(index), "isPrimary": String(service.isPrimary)])
+                console.log("gatt.discoverCharacteristics.request", ["serviceUUID": service.uuid.uuidString, "filter": captureMode ? "all" : "FFB2"])
+                device.discoverCharacteristics(captureMode ? nil : [ffb2], for: service)
             }
         }
     }
-
-    nonisolated func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        Task { @MainActor in
-            guard let chars = service.characteristics else { return }
-            for ch in chars where ch.uuid == self.ffb2 {
-                self.status = "订阅称重数据"
-                peripheral.setNotifyValue(true, for: ch)
+    nonisolated func peripheral(_ device: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        MainActor.assumeIsolated {
+            guard wantsConnection, device === peripheral else { return }
+            console.log("gatt.characteristics.result", ["serviceUUID": service.uuid.uuidString, "error": error?.localizedDescription ?? ""])
+            guard error == nil else { return }
+            for ch in service.characteristics ?? [] where captureMode || ch.uuid == ffb2 {
+                let fields = characteristicFields(device, ch)
+                console.log("gatt.characteristic", fields)
+                if captureMode {
+                    console.log("gatt.discoverDescriptors.request", fields)
+                    device.discoverDescriptors(for: ch)
+                    if ch.properties.contains(.read) {
+                        console.log("gatt.read.request", fields)
+                        device.readValue(for: ch)
+                    }
+                }
+                if ch.properties.contains(.notify) || ch.properties.contains(.indicate) {
+                    console.log("gatt.subscribe.request", fields)
+                    device.setNotifyValue(true, for: ch)
+                    status = captureMode ? "采集中 · 已请求数据订阅" : "订阅称重数据"
+                }
             }
         }
     }
-
-    nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard characteristic.uuid == CBUUID(string: "0000FFB2-0000-1000-8000-00805F9B34FB"),
-              let data = characteristic.value else { return }
-        let rawHex = data.map { String(format: "%02x", $0) }.joined(separator: " ")
-        print("[AFUScale][raw] \(rawHex)")
-        guard let measurement = ScalePacketParser.parse(data) else {
-            print("[AFUScale][skip] parse failed")
-            return
+    nonisolated func peripheral(_ device: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error: Error?) {
+        MainActor.assumeIsolated {
+            guard wantsConnection, device === peripheral else { return }
+            var fields = characteristicFields(device, ch)
+            fields["error"] = error?.localizedDescription ?? ""
+            fields["hex"] = ch.value.map(Self.hex) ?? ""
+            fields["length"] = String(ch.value?.count ?? 0)
+            fields["delivery"] = "CoreBluetooth value callback (read/notify not distinguished by API)"
+            let event = console.log("gatt.value.rx", fields)
+            guard error == nil, ch.uuid == ffb2, let data = ch.value else { return }
+            latestRawHex = Self.hex(data)
+            guard let measurement = ScalePacketParser.parse(data) else {
+                console.log("packet.unparsed", ["sourceSequence": event.map { String($0.sequence) } ?? "", "hex": Self.hex(data)])
+                return
+            }
+            if measurement.isFinal {
+                var parsed = profileFields
+                parsed["sourceSequence"] = event.map { String($0.sequence) } ?? ""
+                parsed["weightKg"] = String(measurement.weightKg)
+                parsed["candidateA"] = measurement.impedance.map { String($0.a) } ?? "0"
+                parsed["candidateB"] = measurement.impedance.map { String($0.b) } ?? "0"
+                parsed["hex"] = Self.hex(data)
+                parsed["scaleStoredProfile"] = "unknown"
+                console.log("measurement.final", parsed)
+            }
+            handle(measurement, rawHex: Self.hex(data))
         }
-        Task { @MainActor in
-            self.handle(measurement, rawHex: rawHex)
+    }
+    nonisolated func peripheral(_ device: CBPeripheral, didUpdateNotificationStateFor ch: CBCharacteristic, error: Error?) {
+        MainActor.assumeIsolated {
+            var fields = characteristicFields(device, ch)
+            fields["error"] = error?.localizedDescription ?? ""
+            console.log("gatt.subscribe.result", fields)
+        }
+    }
+    nonisolated func peripheral(_ device: CBPeripheral, didDiscoverDescriptorsFor ch: CBCharacteristic, error: Error?) {
+        MainActor.assumeIsolated {
+            guard wantsConnection, device === peripheral else { return }
+            var fields = characteristicFields(device, ch)
+            fields["error"] = error?.localizedDescription ?? ""
+            console.log("gatt.descriptors.result", fields)
+            guard captureMode, error == nil else { return }
+            for descriptor in ch.descriptors ?? [] {
+                var item = fields
+                item["descriptorUUID"] = descriptor.uuid.uuidString
+                console.log("gatt.descriptor.read.request", item)
+                device.readValue(for: descriptor)
+            }
+        }
+    }
+    nonisolated func peripheral(_ device: CBPeripheral, didUpdateValueFor descriptor: CBDescriptor, error: Error?) {
+        MainActor.assumeIsolated {
+            var fields = descriptor.characteristic.map { characteristicFields(device, $0) } ?? deviceFields(device)
+            fields["descriptorUUID"] = descriptor.uuid.uuidString
+            fields["error"] = error?.localizedDescription ?? ""
+            if let data = descriptor.value as? Data { fields["hex"] = Self.hex(data) }
+            else { fields["value"] = descriptor.value.map { String(describing: $0) } ?? "" }
+            console.log("gatt.descriptor.rx", fields)
+        }
+    }
+    nonisolated func peripheral(_ device: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error: Error?) {
+        MainActor.assumeIsolated {
+            var fields = characteristicFields(device, ch)
+            fields["error"] = error?.localizedDescription ?? ""
+            console.log("gatt.write.result", fields)
+        }
+    }
+    nonisolated func peripheral(_ device: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        MainActor.assumeIsolated {
+            console.log("gatt.services.invalidated", ["UUIDs": invalidatedServices.map { $0.uuid.uuidString }.joined(separator: ",")])
+            if wantsConnection, device === peripheral { discover(device) }
         }
     }
 }

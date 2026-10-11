@@ -24,6 +24,15 @@ struct ContentView: View {
                 LazyVStack(spacing: 0) {
                     header
                     measurement
+                    if scale.captureMode {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label("蓝牙诊断模式", systemImage: "waveform.path")
+                                .font(.headline)
+                            Text("持续采集全部已发现服务的可读值和通知。收到最终包后保持连接。数据仅保存在本机，进入控制台标注与导出。")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            NavigationLink("进入控制台") { ConsoleView(scale: scale, recorder: scale.console) }
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(24)
+                    }
                     profile
                     history
                     diagnostics
@@ -34,6 +43,9 @@ struct ContentView: View {
             .foregroundStyle(Palette.ink)
             .scrollDismissesKeyboard(.interactively)
             .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink("控制台") { ConsoleView(scale: scale, recorder: scale.console) }
+                }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("完成") { focusedField = nil }
@@ -112,7 +124,7 @@ struct ContentView: View {
                 Text("个人参数")
                     .font(.system(size: 21, weight: .semibold))
                     .tracking(-0.23)
-                Text("用于计算 BMI 与体脂率，修改后会自动保存。")
+                Text("用于计算 BMI 和采集个人参数；体脂算法待验证。修改本页不会设置秤上的用户资料。")
                     .font(.system(size: 14))
                     .foregroundStyle(Palette.muted)
             }
@@ -170,7 +182,12 @@ struct ContentView: View {
                     .foregroundStyle(Palette.muted)
             }
 
-            writeSection
+            Picker("性别", selection: $scale.sex) {
+                Text("男").tag(Sex.male)
+                Text("女").tag(Sex.female)
+            }.pickerStyle(.segmented)
+
+            if !scale.captureMode { writeSection }
         }
         .padding(24)
         .background(Palette.parchment)
@@ -328,7 +345,7 @@ struct ContentView: View {
     }
 
     private var footer: some View {
-        Text("首次使用请允许蓝牙与健康权限。之后 iOS 会在称重广播出现时通过蓝牙后台模式唤醒 App。")
+        Text("采集时保持 App 在前台。请先关闭阿福 App，避免连接被占用。A/B 字段的含义和单位尚未验证；本版不将估算体脂率写入健康。")
             .font(.system(size: 12))
             .foregroundStyle(Palette.muted)
             .frame(maxWidth: .infinity, alignment: .leading)

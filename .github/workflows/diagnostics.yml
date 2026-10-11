@@ -1,0 +1,35 @@
+name: Diagnostics build
+on:
+  push:
+    branches: [codex/diagnostic-console]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test portable capture journal
+        run: swift test
+      - name: Build for iPhone
+        run: |
+          xcodebuild -project AFUScale.xcodeproj -scheme AFUScale -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+      - name: Run iOS unit tests
+        run: |
+          device=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for k,v in d["devices"].items() if "iOS" in k for x in v if "iPhone" in x["name"]))')
+          xcodebuild -project AFUScale.xcodeproj -scheme AFUScale \
+            -destination "platform=iOS Simulator,id=$device" -derivedDataPath build-tests \
+            CODE_SIGNING_ALLOWED=NO test
+      - name: Package side-load IPA
+        run: |
+          mkdir -p build/Payload
+          cp -R build/Build/Products/Release-iphoneos/AFUScale.app build/Payload/
+          (cd build && zip -qry AFUScale-diagnostics-unsigned.ipa Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AFUScale-diagnostics-unsigned
+          path: build/AFUScale-diagnostics-unsigned.ipa

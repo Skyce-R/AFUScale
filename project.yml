@@ -34,3 +34,13 @@ targets:
       - Tests
     dependencies:
       - target: AFUScale
+
+schemes:
+  AFUScale:
+    build:
+      targets:
+        AFUScale: all
+        AFUScaleTests: [test]
+    test:
+      targets:
+        - AFUScaleTests
