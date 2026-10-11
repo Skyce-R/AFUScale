@@ -131,6 +131,8 @@ final class ScaleController: NSObject, ObservableObject {
 
     func startCapture() {
         captureMode = true
+        latest = nil
+        latestRawHex = ""
         wantsConnection = true
         console.start(profile: profileFields)
         // Re-discover the full GATT tree when beginning a fresh session.

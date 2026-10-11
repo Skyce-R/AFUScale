@@ -20,6 +20,9 @@ final class ConsoleRecorder: ObservableObject {
 
     func start(profile: [String: String]) {
         stop()
+        activeURL = nil
+        events = []
+        total = 0
         do {
             var metadata = profile
             metadata["appVersion"] = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
@@ -37,7 +40,7 @@ final class ConsoleRecorder: ObservableObject {
             total = events.count
             errorMessage = nil
             refreshSessions()
-        } catch { report(error) }
+        } catch { journal = nil; report(error) }
     }
 
     func stop() {
