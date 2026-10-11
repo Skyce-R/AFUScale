@@ -198,6 +198,13 @@ final class ScaleController: NSObject, ObservableObject {
         age = d.object(forKey: "AFUScale.age") as? Int ?? 25
         sex = Sex(rawValue: d.string(forKey: "AFUScale.sex") ?? "male") ?? .male
         super.init()
+        console.onWriteFailure = { [weak self] in
+            guard let self else { return }
+            self.wantsConnection = false
+            self.central?.stopScan()
+            if let device = self.peripheral { self.central?.cancelPeripheralConnection(device) }
+            self.status = "日志保存失败，已停止连接；请新建会话重试"
+        }
         console.start(profile: profileFields)
         localRecords = d.data(forKey: Self.localRecordsKey)
             .flatMap { try? JSONDecoder().decode([LocalRecord].self, from: $0) } ?? []
@@ -285,12 +292,16 @@ final class ScaleController: NSObject, ObservableObject {
             print("[AFUScale][skip] not final result packet")
             return
         }
-        print("[AFUScale][save] final result packet")
+        print("[AFUScale][final] final result packet")
         guard !captureMode else { status = "已收到最终包，继续采集"; return }
         save(measurement)
     }
 
     private func save(_ measurement: ScaleMeasurement) {
+        guard heightCm.isFinite, heightCm > 0, measurement.weightKg.isFinite, measurement.weightKg > 0 else {
+            status = "身高或体重无效，未写入健康"
+            return
+        }
         if let lastSavedAt, Date().timeIntervalSince(lastSavedAt) < 90 {
             disconnectFromScale()
             return

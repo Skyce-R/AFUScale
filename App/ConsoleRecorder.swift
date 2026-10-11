@@ -10,6 +10,7 @@ final class ConsoleRecorder: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var total = 0
     @Published private(set) var measurementRevision = 0
+    var onWriteFailure: (() -> Void)?
     private var journal: CaptureJournal?
     private let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("AFU-Diagnostics", isDirectory: true)
@@ -95,5 +96,8 @@ final class ConsoleRecorder: ObservableObject {
                 .filter { $0.pathExtension == "jsonl" }.sorted { $0.lastPathComponent > $1.lastPathComponent }
         } catch { report(error) }
     }
-    private func report(_ error: Error) { errorMessage = "日志保存失败：\(error.localizedDescription)" }
+    private func report(_ error: Error) {
+        errorMessage = "日志保存失败：\(error.localizedDescription)"
+        onWriteFailure?()
+    }
 }

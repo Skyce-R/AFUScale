@@ -21,7 +21,7 @@ struct ConsoleView: View {
                 HStack {
                     Button(recorder.isRecording ? "新建会话" : "开始采集") { scale.startCapture() }
                     Spacer()
-                    Button("停止") { scale.stopCapture() }.disabled(!recorder.isRecording)
+                    Button("停止") { scale.stopCapture() }.disabled(!scale.captureMode)
                 }
                 if let url = recorder.activeURL {
                     NavigationLink("本次测量与标注") { CaptureDetailView(url: url, recorder: recorder) }
